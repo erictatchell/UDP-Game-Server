@@ -156,39 +156,6 @@ void RemoveClientFromFile(const string& ipAddress) {
     }
 }
 
-void UpdateDatagram(string ip, string data, bool isNewClient) {
-    if (isNewClient) {
-        gameState.datagram.append(data);
-    }
-    else {
-        // Find and update existing client data
-        size_t start_pos = 0;
-        while ((start_pos = gameState.datagram.find("%ip:" + ip + ";", start_pos)) != string::npos) {
-            size_t end_pos = gameState.datagram.find('%', start_pos + 1); // Find next '%'
-            if (end_pos == string::npos) {
-                gameState.datagram.replace(start_pos, gameState.datagram.size() - start_pos, data);
-            }
-            else {
-                gameState.datagram.replace(start_pos, end_pos - start_pos, data);
-            }
-            break; // Update only the requested client
-        }
-    }
-}
-
-
-
-
-
-bool IsClientNew(Client client) {
-    for (const auto& existingClient : gameState.players) {
-        if (existingClient.ip == client.ip) {
-            return false;
-        }
-    }
-    return true;
-}
-
 Client FindClientByPlayerId(GameState& gameState, uint16_t playerId) {
     for (Client& client : gameState.players) {
         if (client.playerId == playerId) {
@@ -210,38 +177,43 @@ void RegisterNew(Packet packet, sockaddr_in addr) {
 
 void ParsePacket(const char* buf, Packet& packet) {
     std::string data(buf);
-    size_t pos = 0;
 
-    packet.packetType = static_cast<uint8_t>(std::stoi(data.substr(pos++, 1)));
-    packet.playerId = static_cast<uint16_t>(std::stoi(data.substr(pos++, 1)));
-    packet.movementState = static_cast<uint8_t>(std::stoi(data.substr(pos++, 1)));
-    packet.direction = static_cast<uint8_t>(std::stoi(data.substr(pos++, 1)));
+    packet.packetType = static_cast<uint8_t>(data[0] - '0');
+    packet.movementState = static_cast<uint8_t>(data[2] - '0');
+    packet.direction = static_cast<uint8_t>(data[3] - '0');
+    packet.playerId = static_cast<uint16_t>(std::stoi(data.substr(1, 1)));
 
-    size_t nameStart = pos;
-    while (nameStart < data.length() && std::isdigit(data[nameStart])) {
-        ++nameStart;
+    size_t timestampStart = 4;
+    size_t nameStart = data.find_first_not_of("0123456789", timestampStart);
+    if (nameStart == std::string::npos) {
+        return;
     }
-    packet.timestamp = static_cast<uint32_t>(std::stoul(data.substr(pos, nameStart - pos)));
-    pos = nameStart;
+    packet.timestamp = static_cast<uint32_t>(std::stoul(data.substr(timestampStart, nameStart - timestampStart)));
+    packet.name = data.substr(nameStart);
 }
+
 
 void ReceiveMessages(SOCKET serverSocket) {
     sockaddr_in client;
     int clientLength = sizeof(client);
-    char buf[sizeof(Packet)]; // Adjust buffer size to match Packet size
+    char buf[64]; // Adjust buffer size to match Packet size
     while (!gameState.stopServer) {
+        ZeroMemory(buf, 64);
         int bytesIn = recvfrom(serverSocket, buf, sizeof(buf), 0, (sockaddr*)&client, &clientLength);
         if (bytesIn > 0) {
             Packet packet;
             ParsePacket(buf, packet);
+            cout << "RECV: " << buf << "\n";
             if (packet.packetType == 1) {
                 RegisterNew(packet, client);
             }
+            
             gameState.msg_queue.push(packet);
             NotifyGameLoop();
         }
     }
 }
+
 
 
 void GameLoop(SOCKET serverSocket) {
@@ -262,22 +234,26 @@ void GameLoop(SOCKET serverSocket) {
             buf.append(std::to_string(packet.movementState));
             buf.append(std::to_string(packet.direction));
             buf.append(std::to_string(packet.timestamp));
-            buf += '\0';
+            buf.append(packet.name);
 
-            // Redistribute the packet to other clients
+            // broadcast
+            bool success = true;
+
             for (auto& connectedClient : gameState.players) {
-                if (connectedClient.playerId != id) { // Skip the sender
+                if (connectedClient.playerId != id) { // skip the sender
                     int sendOk = sendto(serverSocket, buf.c_str(), sizeof(Packet), 0, (sockaddr*)&connectedClient.address, sizeof(connectedClient.address));
-                    cout << buf << endl;
                     if (sendOk == SOCKET_ERROR) {
                         std::cerr << "sendto failed: " << WSAGetLastError() << std::endl;
+                        success = false;
                     }
                 }
+            }
+            if (success) {
+                cout << "SEND: " << buf << "\n";
             }
         }
     }
 }
-
 
 
 
@@ -344,6 +320,7 @@ int main() {
     thread receiveThread(ReceiveMessages, serverSocket);
     thread gameLoopThread(GameLoop, serverSocket);
     thread commandListener(command, ref(gameState.players), serverSocket);
+    //thread frequentUpdates(UpdateFrequently);
 
     while (!gameState.stopServer) {
         std::unique_lock<std::mutex> lock(mtx);
